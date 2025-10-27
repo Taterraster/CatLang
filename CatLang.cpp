@@ -1,14 +1,32 @@
+// CatLang.cpp
 #include <iostream>
 #include <fstream>
 #include <string>
 #include <regex>
 #include <unordered_map>
 #include <sstream>
+#include <variant>
+#include <vector>
+#include <functional>
+#include <cctype>
+#include <algorithm>
+#include "function.hpp" // must provide CatValue, CatFunction, parseFunctionArgs, executeFunction
 
 using namespace std;
+using std::get;
+using std::holds_alternative;
 
-// Check for valid .cat or .catlang extension
-bool hasValidCatExtension(const string& filename) {
+// helper to trim
+static inline string trim(string s)
+{
+    s.erase(0, s.find_first_not_of(" \t\r\n"));
+    s.erase(s.find_last_not_of(" \t\r\n") + 1);
+    return s;
+}
+
+// file extension check
+bool hasValidCatExtension(const string &filename)
+{
     const string ext1 = ".cat";
     const string ext2 = ".catlang";
     return (filename.size() >= ext1.size() &&
@@ -17,58 +35,63 @@ bool hasValidCatExtension(const string& filename) {
             filename.compare(filename.size() - ext2.size(), ext2.size(), ext2) == 0);
 }
 
-// Format numbers: remove trailing zeros if decimal
-string formatNumber(double num) {
+// format number (trim trailing zeros)
+string formatNumber(double num)
+{
     ostringstream oss;
     oss << num;
     string s = oss.str();
-    if (s.find('.') != string::npos) {
-        while (!s.empty() && s.back() == '0') s.pop_back();
-        if (!s.empty() && s.back() == '.') s.pop_back();
+    if (s.find('.') != string::npos)
+    {
+        while (!s.empty() && s.back() == '0')
+            s.pop_back();
+        if (!s.empty() && s.back() == '.')
+            s.pop_back();
     }
     return s;
 }
 
-// Replace variables outside quotes
-string replaceVars(const string& expr,
-                   const unordered_map<string, string>& strVars,
-                   const unordered_map<string, double>& numVars) {
+// replace variables outside quotes (keeps literals intact)
+string replaceVars(const string &expr,
+                   const unordered_map<string, string> &strVars,
+                   const unordered_map<string, double> &numVars,
+                   const unordered_map<string, bool> &boolVars)
+{
     string result;
     bool inQuotes = false;
     string segment;
 
-    for (size_t i = 0; i < expr.size(); ++i) {
+    for (size_t i = 0; i < expr.size(); ++i)
+    {
         char c = expr[i];
-        if (c == '"') {
+        if (c == '"')
+        {
             inQuotes = !inQuotes;
             result += c;
-        } else if (!inQuotes) {
-            segment += c;
-        } else {
+            continue;
+        }
+        if (inQuotes)
+        {
             result += c;
+            continue;
         }
 
-        if ((!inQuotes && (i + 1 == expr.size() || expr[i + 1] == '"')) && !segment.empty()) {
-            // Replace string variables without extra quotes
-            for (const auto& [var, val] : strVars)
-                segment = regex_replace(segment, regex("\\b" + var + "\\b"), val);
+        segment += c;
 
-            // Replace numeric variables
-            for (const auto& [var, val] : numVars)
-                segment = regex_replace(segment, regex("\\b" + var + "\\b"), formatNumber(val));
-
-            // Detect undefined variables
-            regex varRegex(R"(\b[a-zA-Z_]\w*\b)");
-            sregex_iterator it(segment.begin(), segment.end(), varRegex);
-            sregex_iterator end;
-            for (; it != end; ++it) {
-                string varName = it->str();
-                if (!strVars.count(varName) && !numVars.count(varName)) {
-                    cerr << "Undefined variable: " << varName << endl;
-                    segment = regex_replace(segment, regex("\\b" + varName + "\\b"), "");
-                }
+        // Process at end or at function call
+        if ((!inQuotes && (i + 1 == expr.size() || expr[i + 1] == '"' || expr[i + 1] == '(')) && !segment.empty())
+        {
+            // Skip segments that are function calls
+            if (segment.find('(') == string::npos)
+            {
+                // Replace only known variables
+                for (const auto &[var, val] : strVars)
+                    segment = regex_replace(segment, regex("\\b" + var + "\\b"), val);
+                for (const auto &[var, val] : numVars)
+                    segment = regex_replace(segment, regex("\\b" + var + "\\b"), formatNumber(val));
+                for (const auto &[var, val] : boolVars)
+                    segment = regex_replace(segment, regex("\\b" + var + "\\b"), val ? "true" : "false");
             }
-
             result += segment;
             segment.clear();
         }
@@ -77,87 +100,687 @@ string replaceVars(const string& expr,
     return result;
 }
 
-int main(int argc, char* argv[]) {
-    if (argc < 2) {
-        cerr << "Usage: catlang <filename>.cat or <filename>.catlang" << endl;
-        return 1;
+// Evaluate numeric expression with parentheses and function calls.
+// This function will:
+//   - substitute known numeric variables
+//   - find function calls (non-nested in this pass) and execute them via executeFunction()
+//   - then parse expression with correct precedence (parentheses, *,/, +,-).
+// NOTE: it uses parseFunctionArgs and executeFunction from function.hpp
+double evalNumericExpression(string expr,
+                             const unordered_map<string, double> &numVars,
+                             const unordered_map<string, bool> &boolVars,
+                             unordered_map<string, string> &strVars_ref, // needed for parseFunctionArgs
+                             unordered_map<string, double> &numVars_ref,
+                             unordered_map<string, bool> &boolVars_ref,
+                             const unordered_map<string, CatFunction> &functions)
+{
+    // 1) replace simple variables (numbers & bools) with numeric literal text
+    // but keep identifiers for function-call detection (we replace variables by number tokens)
+    // We'll replace identifiers that match numVars or boolVars to their numeric string
+    // but leave others (like function names) intact
+    auto replaceSimpleVars = [&](string &s)
+    {
+        string out;
+        for (size_t i = 0; i < s.size();)
+        {
+            if (isalpha((unsigned char)s[i]) || s[i] == '_')
+            {
+                size_t j = i;
+                while (j < s.size() && (isalnum((unsigned char)s[j]) || s[j] == '_'))
+                    ++j;
+                string ident = s.substr(i, j - i);
+                if (numVars.count(ident))
+                    out += formatNumber(numVars.at(ident));
+                else if (boolVars.count(ident))
+                    out += (boolVars.at(ident) ? "1" : "0");
+                else
+                    out += ident; // maybe a function name or undefined (will be caught)
+                i = j;
+            }
+            else
+            {
+                out.push_back(s[i++]);
+            }
+        }
+        s.swap(out);
+    };
+
+    replaceSimpleVars(expr);
+
+    // 2) Execute inner-most function calls iteratively:
+    // pattern: name(arg1, arg2, ...)
+    // We'll find calls with no nested parentheses inside the parentheses (i.e. handle simplest cases first).
+    // For nested calls, repeated application will handle them.
+    regex funcCallPattern(R"((\b[a-zA-Z_]\w*)\s*\((([^()]|(?R))*)\))"); // using PCRE-like recursion isn't supported; we'll instead use a simpler loop
+    // Simpler approach: find leftmost '(' and find its matching ')' and check token before '(' for name.
+    auto findNextFuncCall = [&](const string &s, size_t &startPos, size_t &endPos, string &fname, string &argsout) -> bool
+    {
+        // find '('
+        size_t p = s.find('(', startPos);
+        if (p == string::npos)
+            return false;
+        // find matching ')' by counting
+        size_t j = p;
+        int depth = 0;
+        for (; j < s.size(); ++j)
+        {
+            if (s[j] == '(')
+                ++depth;
+            else if (s[j] == ')')
+            {
+                --depth;
+                if (depth == 0)
+                    break;
+            }
+        }
+        if (j >= s.size())
+            return false;
+        // find function name before '(' (skip whitespace)
+        size_t k = p;
+        while (k > 0 && isspace((unsigned char)s[k - 1]))
+            --k;
+        size_t nameEnd = k;
+        size_t nameStart = nameEnd;
+        while (nameStart > 0 && (isalnum((unsigned char)s[nameStart - 1]) || s[nameStart - 1] == '_'))
+            --nameStart;
+        if (nameStart == nameEnd)
+            return false;
+        fname = s.substr(nameStart, nameEnd - nameStart);
+        argsout = s.substr(p + 1, j - (p + 1));
+        startPos = nameStart;
+        endPos = j;
+        return true;
+    };
+
+    // iterate until no function calls remain
+    while (true)
+    {
+        size_t sp = 0;
+        size_t ep = 0;
+        string fname, argsstr;
+        if (!findNextFuncCall(expr, sp, ep, fname, argsstr))
+            break;
+
+        // ensure function exists
+        if (!functions.count(fname))
+        {
+            cerr << "Undefined function: " << fname << endl;
+            // remove the call to avoid infinite loop: replace with 0
+            expr.replace(sp, ep - sp + 1, "0");
+            continue;
+        }
+
+        // parse args using helper in function.hpp
+        vector<CatValue> parsedArgs = parseFunctionArgs(argsstr, strVars_ref, numVars_ref, boolVars_ref);
+
+        // execute
+        CatValue cres = executeFunction(functions.at(fname), parsedArgs, strVars_ref, numVars_ref, boolVars_ref);
+
+        // convert result to numeric string (for insertion)
+        string numericReplacement = "0";
+        if (holds_alternative<double>(cres))
+            numericReplacement = formatNumber(get<double>(cres));
+        else if (holds_alternative<bool>(cres))
+            numericReplacement = get<bool>(cres) ? "1" : "0";
+        else if (holds_alternative<string>(cres))
+        {
+            // string in numeric context -> try parse number, else 0
+            try
+            {
+                double v = stod(get<string>(cres));
+                numericReplacement = formatNumber(v);
+            }
+            catch (...)
+            {
+                numericReplacement = "0";
+            }
+        }
+        else
+        {
+            numericReplacement = "0";
+        }
+
+        // replace fname(...) range with numericReplacement
+        // note: ep is ')' index; we replace from sp .. ep inclusive
+        expr.replace(sp, ep - sp + 1, numericReplacement);
     }
 
+    // 3) Now we have an expression with only numbers, operators, parentheses (hopefully). Evaluate it with precedence.
+
+    // Shunting-yard or recursive descent parser. Implement recursive descent:
+    const string s = expr;
+    size_t pos = 0;
+    function<void()> skipSpaces = [&]()
+    { while (pos < s.size() && isspace((unsigned char)s[pos])) ++pos; };
+
+    function<double()> parseExpr; // forward
+    function<double()> parseTerm;
+    function<double()> parseFactor;
+
+    parseFactor = [&]() -> double
+    {
+        skipSpaces();
+        if (pos < s.size() && s[pos] == '(')
+        {
+            ++pos;
+            double v = parseExpr();
+            skipSpaces();
+            if (pos < s.size() && s[pos] == ')')
+                ++pos;
+            return v;
+        }
+        // parse number (with optional leading + or -)
+        size_t start = pos;
+        if (pos < s.size() && (s[pos] == '+' || s[pos] == '-'))
+            ++pos;
+        bool dotSeen = false;
+        while (pos < s.size() && (isdigit((unsigned char)s[pos]) || s[pos] == '.'))
+        {
+            if (s[pos] == '.')
+            {
+                if (dotSeen)
+                    break;
+                dotSeen = true;
+            }
+            ++pos;
+        }
+        string numtok = s.substr(start, pos - start);
+        if (numtok.empty() || numtok == "+" || numtok == "-")
+        {
+            // invalid - return 0
+            return 0.0;
+        }
+        try
+        {
+            return stod(numtok);
+        }
+        catch (...)
+        {
+            return 0.0;
+        }
+    };
+
+    parseTerm = [&]() -> double
+    {
+        double val = parseFactor();
+        while (true)
+        {
+            skipSpaces();
+            if (pos >= s.size())
+                break;
+            char op = s[pos];
+            if (op != '*' && op != '/')
+                break;
+            ++pos;
+            double rhs = parseFactor();
+            if (op == '*')
+                val *= rhs;
+            else if (op == '/')
+                val /= rhs;
+        }
+        return val;
+    };
+
+    parseExpr = [&]() -> double
+    {
+        double val = parseTerm();
+        while (true)
+        {
+            skipSpaces();
+            if (pos >= s.size())
+                break;
+            char op = s[pos];
+            if (op != '+' && op != '-')
+                break;
+            ++pos;
+            double rhs = parseTerm();
+            if (op == '+')
+                val += rhs;
+            else
+                val -= rhs;
+        }
+        return val;
+    };
+
+    try
+    {
+        pos = 0;
+        double res = parseExpr();
+        return res;
+    }
+    catch (...)
+    {
+        cerr << "Invalid numeric expression: " << expr << endl;
+        return 0.0;
+    }
+}
+
+int main(int argc, char *argv[])
+{
+    if (argc < 2)
+    {
+        cerr << "Usage: catlang <file>.cat" << endl;
+        return 1;
+    }
     string filename = argv[1];
-    if (!hasValidCatExtension(filename)) {
-        cerr << "Error: Only .cat or .catlang files can be interpreted by CatLang" << endl;
+    if (!hasValidCatExtension(filename))
+    {
+        cerr << "Only .cat or .catlang files allowed" << endl;
         return 1;
     }
 
     ifstream file(filename);
-    if (!file.is_open()) {
+    if (!file.is_open())
+    {
         cerr << "Could not open file: " << filename << endl;
         return 1;
     }
 
-
-
     unordered_map<string, string> strVars;
     unordered_map<string, double> numVars;
+    unordered_map<string, bool> boolVars;
+    unordered_map<string, CatFunction> functions;
 
     string line;
-    regex purrRegex(R"(^\s*purr\s*~>\s*(.+);\s*$)");
+    string outputLineBuffer; // buffer for purr concatenation across purr statements
+
+    // regexes
+    regex purrRegex(R"(^\s*purr\s*~>\s*(.*?)\s*;\s*$)");
     regex strVarRegex(R"(^\s*str\s+([a-zA-Z_]\w*)\s*~>\s*(.+);\s*$)");
     regex numVarRegex(R"(^\s*num\s+([a-zA-Z_]\w*)\s*~>\s*(.+);\s*$)");
-    smatch match;
+    regex boolVarRegex(R"(^\s*bool\s+([a-zA-Z_]\w*)\s*~>\s*(true|false)\s*;\s*$)", regex_constants::icase);
+    regex funcDefRegex(R"(^\s*(num|str|bool|void)\s+([a-zA-Z_]\w*)\s*\((.*)\)\s*\{\s*$)");
+    regex funcCallRegex(R"((\w+)\(([^)]*)\))");
+    regex assignFuncCallRegex(R"(^\s*(num|str|bool)\s+([a-zA-Z_]\w*)\s*~>\s*([a-zA-Z_]\w*\(.*\))\s*;\s*$)");
+    regex funcCallOnlyRegex(R"(^\s*([a-zA-Z_]\w*)\s*\((.*)\)\s*;\s*$)");
+    regex funcRegex(R"(^\s*(num|str|bool|void)\s+([a-zA-Z_]\w*)\s*\(([^)]*)\)\s*\{\s*$)");
+    bool inMultilineComment = false;
+    string lineBuffer;
+    while (getline(file, line))
+    {
+        // handle multi-line comment continuations
+        if (inMultilineComment)
+        {
+            size_t endc = line.find("*/");
+            if (endc != string::npos)
+            {
+                line = line.substr(endc + 2);
+                inMultilineComment = false;
+            }
+            else
+                continue;
+        }
 
-    while (getline(file, line)) {
-        // Remove single-line comments
-        size_t commentPos = line.find("//");
-        if (commentPos != string::npos)
-            line = line.substr(0, commentPos);
+        // strip start of multiline comment on this line
+        size_t startc = line.find("/*");
+        if (startc != string::npos)
+        {
+            size_t endc = line.find("*/", startc + 2);
+            if (endc != string::npos)
+            {
+                // comment open and close same line: remove the segment
+                line.erase(startc, endc - startc + 2);
+            }
+            else
+            {
+                line = line.substr(0, startc);
+                inMultilineComment = true;
+            }
+        }
 
-        // Skip empty lines
-        if (line.find_first_not_of(" \t\n\r") == string::npos)
+        // single-line comments
+        size_t singlec = line.find("//");
+        if (singlec != string::npos)
+            line = line.substr(0, singlec);
+
+        // skip empty
+        if (line.find_first_not_of(" \t\r\n") == string::npos)
             continue;
 
-        // purr command
-        if (regex_match(line, match, purrRegex)) {
-            string expr = match[1];
-            string replaced = replaceVars(expr, strVars, numVars);
+        smatch match;
 
-            // Handle concatenation with +
-            regex concatRegex(R"(\s*\+\s*)");
-            sregex_token_iterator iter(replaced.begin(), replaced.end(), concatRegex, -1);
-            sregex_token_iterator end;
+        // 1) function definition (must be handled before other patterns)
+        if (regex_match(line, match, funcDefRegex))
+        {
+            string returnType = match[1];
+            string fname = match[2];
+            string argsList = match[3];
+
+            // parse args
+            vector<FuncArg> args;
+            stringstream ss(argsList);
+            string a;
+            while (getline(ss, a, ','))
+            {
+                a = trim(a);
+                if (a.empty())
+                    continue;
+                stringstream as(a);
+                string t, n;
+                as >> t >> n;
+                if (!t.empty() && !n.empty())
+                    args.push_back({t, n});
+            }
+
+            // collect body with brace counting
+            vector<string> body;
+            int braceCount = 1; // already saw opening '{' in the header line
+            while (getline(file, line))
+            {
+                // adjust counts for nested braces
+                for (char ch : line)
+                {
+                    if (ch == '{')
+                        ++braceCount;
+                    else if (ch == '}')
+                        --braceCount;
+                }
+                body.push_back(line);
+                if (braceCount == 0)
+                    break;
+            }
+
+            // store (note: body includes the closing '}' line; executeFunction should handle lines/returns)
+            functions[fname] = CatFunction{returnType, args, body};
+            continue;
+        }
+
+        // 2) assignment from function call like: num x ~> add(a,b);
+        if (regex_match(line, match, assignFuncCallRegex))
+        {
+            string varType = match[1];
+            string varName = match[2];
+            string funcCall = match[3];
+
+            // extract function name and arg list
+            smatch callm;
+            regex callRegex(R"(^\s*([a-zA-Z_]\w*)\s*\((.*)\)\s*$)");
+            if (!regex_match(funcCall, callm, callRegex))
+            {
+                cerr << "Invalid function call in assignment: " << funcCall << endl;
+                continue;
+            }
+            string fname = callm[1];
+            string argList = callm[2];
+
+            if (!functions.count(fname))
+            {
+                cerr << "Undefined function: " << fname << endl;
+                continue;
+            }
+
+            vector<CatValue> parsedArgs = parseFunctionArgs(argList, strVars, numVars, boolVars);
+            CatValue cres = executeFunction(functions.at(fname), parsedArgs, strVars, numVars, boolVars);
+
+            // assign according to varType
+            if (varType == "num")
+            {
+                if (holds_alternative<double>(cres))
+                    numVars[varName] = get<double>(cres);
+                else if (holds_alternative<bool>(cres))
+                    numVars[varName] = get<bool>(cres) ? 1.0 : 0.0;
+                else
+                {
+                    cerr << "Type mismatch: expected num from function " << fname << endl;
+                }
+            }
+            else if (varType == "str")
+            {
+                if (holds_alternative<string>(cres))
+                    strVars[varName] = get<string>(cres);
+                else
+                {
+                    cerr << "Type mismatch: expected str from function " << fname << endl;
+                }
+            }
+            else if (varType == "bool")
+            {
+                if (holds_alternative<bool>(cres))
+                    boolVars[varName] = get<bool>(cres);
+                else
+                {
+                    cerr << "Type mismatch: expected bool from function " << fname << endl;
+                }
+            }
+            continue;
+        }
+
+        // --- purr command ---
+        if (regex_match(line, match, purrRegex))
+        {
+            string expr = match[1];
+
+            // Check if it's a function call like hello(thing)
+            regex funcCallOnlyRegex(R"((\w+)\((.*)\))");
+            smatch funcMatch;
             string output;
 
-            for (; iter != end; ++iter) {
-                string part = iter->str();
-                if (part.size() >= 2 && part.front() == '"' && part.back() == '"')
-                    part = part.substr(1, part.size() - 2);
-                output += part;
+            if (regex_match(expr, funcMatch, funcCallOnlyRegex))
+            {
+                string funcName = funcMatch[1];
+                string argList = funcMatch[2];
+
+                if (!functions.count(funcName))
+                {
+                    cerr << "Undefined function: " << funcName << endl;
+                }
+                else
+                {
+                    vector<CatValue> argValues = parseFunctionArgs(argList, strVars, numVars, boolVars);
+                    CatValue result = executeFunction(functions[funcName], argValues, strVars, numVars, boolVars);
+
+                    // Convert result to string for printing
+                    if (std::holds_alternative<std::string>(result))
+                        output = std::get<std::string>(result);
+                    else if (std::holds_alternative<double>(result))
+                        output = formatNumber(std::get<double>(result));
+                    else if (std::holds_alternative<bool>(result))
+                        output = std::get<bool>(result) ? "true" : "false";
+                }
+            }
+            else
+            {
+                // Handle concatenation with '+'
+                regex concatRegex(R"(\s*\+\s*)");
+                sregex_token_iterator iter(expr.begin(), expr.end(), concatRegex, -1);
+                sregex_token_iterator end;
+
+                for (; iter != end; ++iter)
+                {
+                    string part = iter->str();
+                    part.erase(0, part.find_first_not_of(" \t"));
+                    part.erase(part.find_last_not_of(" \t") + 1);
+
+                    if (part == "endl")
+                    {
+                        output += "\n";
+                    }
+                    else if (!part.empty() && part.front() == '"' && part.back() == '"')
+                    {
+                        output += part.substr(1, part.size() - 2); // strip quotes
+                    }
+                    else if (strVars.count(part))
+                    {
+                        output += strVars[part];
+                    }
+                    else if (numVars.count(part))
+                    {
+                        output += formatNumber(numVars[part]);
+                    }
+                    else if (boolVars.count(part))
+                    {
+                        output += boolVars[part] ? "true" : "false";
+                    }
+                    else
+                    {
+                        output += part; // fallback
+                    }
+                }
             }
 
-            cout << output << endl;
+            cout << output;
+            continue;
         }
-        // string variable
-        else if (regex_match(line, match, strVarRegex)) {
-            string name = match[1];
-            string val = match[2];
-            if (!val.empty() && val.front() == '"' && val.back() == '"')
-                val = val.substr(1, val.size() - 2);
-            strVars[name] = val;
-        }
-        // numeric variable
-        else if (regex_match(line, match, numVarRegex)) {
-            string name = match[1];
-            string val = match[2];
-            try {
-                numVars[name] = stod(val);
-            } catch (...) {
-                cerr << "Invalid numeric value for variable: " << name << endl;
+
+        // 4) variable declarations that may include expressions or function calls
+        if (regex_match(line, match, numVarRegex))
+        {
+            string varName = match[1];
+            string expr = match[2];
+            try
+            {
+                double value = evaluateNumericExpression(expr, numVars); // new function
+                numVars[varName] = value;
             }
+            catch (...)
+            {
+                cerr << "Invalid numeric value: " << varName << endl;
+            }
+            continue;
         }
-        // unknown command
-        else if (line.find_first_not_of(" \t\n\r") != string::npos) {
-            cerr << "Unknown command: " << line << endl;
+
+        if (regex_match(line, match, strVarRegex))
+        {
+            string varName = match[1];
+            string rhs = trim(match[2]);
+            // if rhs is a function call, handle it
+            smatch fm;
+            regex callRx(R"(^\s*([a-zA-Z_]\w*)\s*\((.*)\)\s*$)");
+            if (regex_match(rhs, fm, callRx))
+            {
+                string fname = fm[1];
+                string argList = fm[2];
+                if (!functions.count(fname))
+                {
+                    cerr << "Undefined function: " << fname << endl;
+                    continue;
+                }
+                vector<CatValue> parsedArgs = parseFunctionArgs(argList, strVars, numVars, boolVars);
+                CatValue cres = executeFunction(functions.at(fname), parsedArgs, strVars, numVars, boolVars);
+                if (holds_alternative<string>(cres))
+                    strVars[varName] = get<string>(cres);
+                else
+                    cerr << "Type mismatch: expected str from function " << fname << endl;
+            }
+            else
+            {
+                // literal string expected
+                if (!rhs.empty() && rhs.front() == '"' && rhs.back() == '"')
+                    strVars[varName] = rhs.substr(1, rhs.size() - 2);
+                else
+                {
+                    // maybe variable name
+                    if (strVars.count(rhs))
+                        strVars[varName] = strVars[rhs];
+                    else
+                    {
+                        cerr << "Invalid string assignment: " << rhs << endl;
+                    }
+                }
+            }
+            continue;
         }
+
+        if (regex_match(line, match, boolVarRegex))
+        {
+            string varName = match[1];
+            string rhs = trim(match[2]);
+            // rhs could be function call
+            smatch fm;
+            regex callRx(R"(^\s*([a-zA-Z_]\w*)\s*\((.*)\)\s*$)");
+            if (regex_match(rhs, fm, callRx))
+            {
+                string fname = fm[1];
+                string argList = fm[2];
+                if (!functions.count(fname))
+                {
+                    cerr << "Undefined function: " << fname << endl;
+                    continue;
+                }
+                vector<CatValue> parsedArgs = parseFunctionArgs(argList, strVars, numVars, boolVars);
+                CatValue cres = executeFunction(functions.at(fname), parsedArgs, strVars, numVars, boolVars);
+                if (holds_alternative<bool>(cres))
+                    boolVars[varName] = get<bool>(cres);
+                else
+                    cerr << "Type mismatch: expected bool from function " << fname << endl;
+            }
+            else
+            {
+                boolVars[varName] = (rhs == "true" || rhs == "TRUE");
+            }
+            continue;
+        }
+
+        // 5) standalone function call with semicolon, e.g., sayGoodbye(username);
+        if (regex_match(line, match, funcCallOnlyRegex))
+        {
+            string fname = match[1];
+            string argList = match[2];
+            if (!functions.count(fname))
+            {
+                cerr << "Undefined function: " << fname << endl;
+                continue;
+            }
+            vector<CatValue> parsedArgs = parseFunctionArgs(argList, strVars, numVars, boolVars);
+            executeFunction(functions.at(fname), parsedArgs, strVars, numVars, boolVars);
+            continue;
+        }
+        // --- Function definitions ---
+        if (regex_match(line, match, funcRegex))
+        {
+            std::string returnType = match[1];
+            std::string funcName = match[2];
+            std::string argsList = match[3];
+
+            std::vector<FuncArg> args;
+            std::stringstream ss(argsList);
+            std::string arg;
+            while (getline(ss, arg, ','))
+            {
+                std::stringstream argStream(arg);
+                std::string type, name;
+                argStream >> type >> name;
+                if (!type.empty() && !name.empty())
+                {
+                    args.push_back({type, name});
+                }
+            }
+
+            std::vector<std::string> funcBody;
+            int braceCount = 1; // already found one '{'
+
+            // Read the function body until closing '}'
+            while (getline(file, line))
+            {
+                size_t openBraces = count(line.begin(), line.end(), '{');
+                size_t closeBraces = count(line.begin(), line.end(), '}');
+                braceCount += openBraces;
+                braceCount -= closeBraces;
+
+                funcBody.push_back(line);
+                if (braceCount == 0)
+                    break;
+            }
+
+            // Register the function
+            CatFunction func;
+            func.returnType = returnType;
+            func.args = args;
+            func.body = funcBody;
+            functions[funcName] = func;
+
+            continue; // go to next line after the function
+        }
+
+        // 6) unknown command
+        cerr << "Unknown command: " << line << endl;
+    }
+
+    // flush any pending purr buffer
+    if (!outputLineBuffer.empty())
+    {
+        cout << outputLineBuffer << endl;
+        outputLineBuffer.clear();
     }
 
     return 0;
