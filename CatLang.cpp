@@ -10,11 +10,132 @@
 #include <functional>
 #include <cctype>
 #include <algorithm>
-#include "function.hpp" // must provide CatValue, CatFunction, parseFunctionArgs, executeFunction
+#include "function.hpp"
+#include "statements.hpp"
 
 using namespace std;
-using std::get;
-using std::holds_alternative;
+
+void executeLine(const string &line,
+                 unordered_map<string, string> &strVars,
+                 unordered_map<string, double> &numVars,
+                 unordered_map<string, bool> &boolVars,
+                 unordered_map<string, CatFunction> &functions)
+{
+    // This simply reuses your existing main loop logic for line execution.
+    // For now, just re-run the logic that handles "purr", variables, and function calls.
+    smatch match;
+    regex purrRegex(R"(^\s*purr\s*~>\s*(.+);\s*$)");
+    regex strVarRegex(R"(^\s*str\s+([a-zA-Z_]\w*)\s*~>\s*(.+);\s*$)");
+    regex numVarRegex(R"(^\s*num\s+([a-zA-Z_]\w*)\s*~>\s*(.+);\s*$)");
+    regex boolVarRegex(R"(^\s*bool\s+([a-zA-Z_]\w*)\s*~>\s*(true|false)\s*;\s*$)", regex_constants::icase);
+    regex funcCallRegex(R"((\w+)\s*\((.*)\))");
+    regex ifRegex(R"(^\s*if\s*\((.*)\)\s*\{\s*$)");
+    regex elseRegex(R"(^\s*else\s*\{\s*$)");
+    if (regex_match(line, match, purrRegex))
+    {
+        string expr = match[1];
+        string replaced = replaceVars(expr, strVars, numVars, boolVars);
+
+        regex concatRegex(R"(\s*\+\s*)");
+        sregex_token_iterator iter(replaced.begin(), replaced.end(), concatRegex, -1);
+        sregex_token_iterator end;
+        string output;
+
+        for (; iter != end; ++iter)
+        {
+            string part = iter->str();
+            if (part == "endl")
+                cout << output << endl, output.clear();
+            else if (part.size() >= 2 && part.front() == '"' && part.back() == '"')
+                output += part.substr(1, part.size() - 2);
+            else
+                output += part;
+        }
+        if (!output.empty())
+            cout << output;
+        return;
+    }
+
+    if (regex_match(line, match, strVarRegex))
+    {
+        string name = match[1];
+        string val = match[2];
+        if (!val.empty() && val.front() == '"' && val.back() == '"')
+            val = val.substr(1, val.size() - 2);
+        strVars[name] = val;
+        return;
+    }
+
+    if (regex_match(line, match, numVarRegex))
+    {
+        string name = match[1];
+        string val = match[2];
+        try
+        {
+            numVars[name] = stod(val);
+        }
+        catch (...)
+        {
+            cerr << "Invalid numeric value: " << name << endl;
+        }
+        return;
+    }
+
+    if (regex_match(line, match, boolVarRegex))
+    {
+        string name = match[1];
+        string val = match[2];
+        boolVars[name] = (val == "true" || val == "TRUE");
+        return;
+    }
+
+    if (regex_match(line, match, funcCallRegex))
+    {
+        string funcName = match[1];
+        string args = match[2];
+
+        if (!functions.count(funcName))
+        {
+            cerr << "Undefined function: " << funcName << endl;
+            return;
+        }
+
+        const CatFunction &func = functions[funcName];
+        vector<CatValue> argValues;
+        stringstream ss(args);
+        string arg;
+
+        while (getline(ss, arg, ','))
+        {
+            arg.erase(0, arg.find_first_not_of(" \t"));
+            arg.erase(arg.find_last_not_of(" \t") + 1);
+            if (arg.empty())
+                continue;
+            if (arg.front() == '"' && arg.back() == '"')
+                argValues.push_back(arg.substr(1, arg.size() - 2));
+            else if (numVars.count(arg))
+                argValues.push_back(numVars[arg]);
+            else if (strVars.count(arg))
+                argValues.push_back(strVars[arg]);
+            else if (boolVars.count(arg))
+                argValues.push_back(boolVars[arg]);
+            else
+                try
+                {
+                    argValues.push_back(stod(arg));
+                }
+                catch (...)
+                {
+                    argValues.push_back(arg == "true");
+                }
+        }
+
+        executeFunction(func, argValues, strVars, numVars, boolVars);
+        return;
+    }
+
+    cerr << "Unknown command: " << line << endl;
+}
 
 // helper to trim
 static inline string trim(string s)
@@ -394,6 +515,8 @@ int main(int argc, char *argv[])
     regex assignFuncCallRegex(R"(^\s*(num|str|bool)\s+([a-zA-Z_]\w*)\s*~>\s*([a-zA-Z_]\w*\(.*\))\s*;\s*$)");
     regex funcCallOnlyRegex(R"(^\s*([a-zA-Z_]\w*)\s*\((.*)\)\s*;\s*$)");
     regex funcRegex(R"(^\s*(num|str|bool|void)\s+([a-zA-Z_]\w*)\s*\(([^)]*)\)\s*\{\s*$)");
+    regex ifRegex(R"(^\s*if\s*\((.+)\)\s*\{\s*$)");
+    regex elseRegex(R"(^\s*(?:\}\s*)?else\s*\{\s*$)");
     bool inMultilineComment = false;
     string lineBuffer;
     while (getline(file, line))
@@ -570,12 +693,12 @@ int main(int argc, char *argv[])
                     CatValue result = executeFunction(functions[funcName], argValues, strVars, numVars, boolVars);
 
                     // Convert result to string for printing
-                    if (std::holds_alternative<std::string>(result))
-                        output = std::get<std::string>(result);
-                    else if (std::holds_alternative<double>(result))
-                        output = formatNumber(std::get<double>(result));
-                    else if (std::holds_alternative<bool>(result))
-                        output = std::get<bool>(result) ? "true" : "false";
+                    if (holds_alternative<string>(result))
+                        output = get<string>(result);
+                    else if (holds_alternative<double>(result))
+                        output = formatNumber(get<double>(result));
+                    else if (holds_alternative<bool>(result))
+                        output = get<bool>(result) ? "true" : "false";
                 }
             }
             else
@@ -728,17 +851,17 @@ int main(int argc, char *argv[])
         // --- Function definitions ---
         if (regex_match(line, match, funcRegex))
         {
-            std::string returnType = match[1];
-            std::string funcName = match[2];
-            std::string argsList = match[3];
+            string returnType = match[1];
+            string funcName = match[2];
+            string argsList = match[3];
 
-            std::vector<FuncArg> args;
-            std::stringstream ss(argsList);
-            std::string arg;
+            vector<FuncArg> args;
+            stringstream ss(argsList);
+            string arg;
             while (getline(ss, arg, ','))
             {
-                std::stringstream argStream(arg);
-                std::string type, name;
+                stringstream argStream(arg);
+                string type, name;
                 argStream >> type >> name;
                 if (!type.empty() && !name.empty())
                 {
@@ -746,7 +869,7 @@ int main(int argc, char *argv[])
                 }
             }
 
-            std::vector<std::string> funcBody;
+            vector<string> funcBody;
             int braceCount = 1; // already found one '{'
 
             // Read the function body until closing '}'
@@ -771,7 +894,87 @@ int main(int argc, char *argv[])
 
             continue; // go to next line after the function
         }
+        // --- If statements ---
 
+        if (regex_match(line, match, ifRegex))
+        {
+            string conditionExpr = match[1];
+
+            // Gather true block
+            vector<string> trueBlock;
+            int braceDepth = 1;
+            while (getline(file, line))
+            {
+                if (line.find('{') != string::npos)
+                    braceDepth++;
+                if (line.find('}') != string::npos)
+                    braceDepth--;
+                if (braceDepth == 0)
+                    break;
+                trueBlock.push_back(line);
+            }
+
+            // Check if next line is else
+            streampos prevPos = file.tellg();
+            string nextLine;
+            vector<string> falseBlock;
+            if (getline(file, nextLine) && regex_match(nextLine, elseRegex))
+            {
+                braceDepth = 1;
+                while (getline(file, line))
+                {
+                    if (line.find('{') != string::npos)
+                        braceDepth++;
+                    if (line.find('}') != string::npos)
+                        braceDepth--;
+                    if (braceDepth == 0)
+                        break;
+                    falseBlock.push_back(line);
+                }
+            }
+            else
+            {
+                file.seekg(prevPos);
+            }
+
+            bool condResult = evaluateCondition(conditionExpr, strVars, numVars, boolVars);
+            executeIfStatement(condResult, trueBlock, falseBlock, strVars, numVars, boolVars, functions);
+            continue;
+        }
+        if (regex_match(line, match, ifRegex))
+        {
+            std::string condExpr = match[1];
+            bool condResult = evaluateCondition(condExpr, strVars, numVars, boolVars);
+
+            std::vector<std::string> trueBlock;
+            std::vector<std::string> falseBlock;
+
+            int braceCount = 1; // already consumed opening {
+
+            bool readingTrue = true;
+            while (getline(file, line))
+            {
+                braceCount += std::count(line.begin(), line.end(), '{');
+                braceCount -= std::count(line.begin(), line.end(), '}');
+
+                if (regex_match(line, elseRegex) && braceCount == 1)
+                {
+                    readingTrue = false;
+                    continue; // skip the `else {` line
+                }
+
+                if (readingTrue)
+                    trueBlock.push_back(line);
+                else
+                    falseBlock.push_back(line);
+
+                if (braceCount == 0)
+                    break; // finished both blocks
+            }
+
+            executeIfStatement(condResult, trueBlock, falseBlock, strVars, numVars, boolVars, functions);
+            continue; // do not fall through to unknown command
+        }
         // 6) unknown command
         cerr << "Unknown command: " << line << endl;
     }

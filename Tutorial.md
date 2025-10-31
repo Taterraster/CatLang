@@ -46,3 +46,18 @@ purr ~> "Age: " + age;
 purr ~> "Weight: " + weight + "kg";
 ```
 simple script
+
+```
+num x ~> 3;
+num y ~> 5;
+
+if (x < y) {
+    purr ~> "x is less than y" + endl;
+} 
+else {
+    purr ~> "x is not less than y" + endl;
+}
+
+```
+if statement
+(btw if else is like } else { its gonna be an error)
